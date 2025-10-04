@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html lang="fa">
+<head>
+<meta charset="utf-8" />
+<title>Hirzer-like Marker Detection (JS)</title>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<style>
+  body { margin:0; font-family: sans-serif; background:#111; color:#ddd; }
+  #video, #drawCanvas { position:fixed; top:0; left:0; width:100%; height:100%; object-fit:cover; }
+  #ui {
+    position:fixed; left:10px; top:10px; background:rgba(0,0,0,0.5); padding:8px; border-radius:8px;
+    font-family:monospace; font-size:13px;
+  }
+  #controls { margin-top:6px; display:flex; gap:6px; flex-wrap:wrap; }
+  button, input[type=range] { font-size:13px; }
+  .small { font-size:12px; color:#aaa; }
+</style>
+</head>
+<body>
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="drawCanvas"></canvas>
+
+  <div id="ui">
+    <div id="status">درحال آماده‌سازی...</div>
+    <div id="controls">
+      <label class="small">grid:<input id="gridRange" type="range" min="6" max="24" value="12"></label>
+      <label class="small">edgelThr:<input id="edgelThr" type="range" min="10" max="80" value="30"></label>
+      <label class="small">ransacIters:<input id="ransacIter" type="range" min="50" max="700" value="220"></label>
+      <button id="toggleDebug">toggle debug</button>
+    </div>
+    <div class="small" id="coords"></div>
+  </div>
+
+<script>
+/*
+  نسخه‌ی ساده‌شده و عملی از الگوریتم Hirzer (2008):
+   - Sobel gradient -> edgels on coarse grid
+   - RANSAC line detection
+   - Merge & extend (ساده)
+   - Intersect lines -> quadrangles
+  پارامترها قابل تنظیم از طریق UI برای تست و بهینه‌سازی روی سخت‌افزارهای مختلف.
+*/
+
+// DOM
+const video = document.getElementById('video');
+const drawCanvas = document.getElementById('drawCanvas');
+const ctx = drawCanvas.getContext('2d');
+const status = document.getElementById('status');
+const coordsDiv = document.getElementById('coords');
+const gridRange = document.getElementById('gridRange');
+const edgelThrInput = document.getElementById('edgelThr');
+const ransacIterInput = document.getElementById('ransacIter');
+const toggleDebugBtn = document.getElementById('toggleDebug');
+
+let debug = false;
+toggleDebugBtn.onclick = () => { debug = !debug; };
+
+// تنظیمات پردازش (قابل تغییر با UI)
+function params() {
+  return {
+    targetWidth: 360,           // اندازه مقیاس برای پردازش (برای سرعت)
+    gridStep: parseInt(gridRange.value,10), // اندازه‌ی گرید coarse
+    edgelThreshold: parseInt(edgelThrInput.value,10), // آستانه قدرتمند بودن گرادیان
+    ransacIters: parseInt(ransacIterInput.value,10), // تعداد تکرار RANSAC
+    supportDist: 3.0,           // فاصله پشتیبان (پیکسل در مقیاس پردازش)
+    supportAngleDeg: 22,        // تفاوت زاویه مجاز (درجه)
+    minSupport: 16,             // حداقل پشتیبان لازم برای قبول یک خط
+    maxLines: 8                 // حداکثر تعداد خطوط خروجی
+  };
+}
+
+// دسترسی به دوربین
+async function startCamera() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio:false });
+    video.srcObject = stream;
+    await video.play();
+    status.innerText = 'دوربین آماده است — در حال پردازش...';
+    requestAnimationFrame(processFrame);
+  } catch (e) {
+    status.innerText = 'دسترسی دوربین مقدور نیست: ' + e.message;
+    console.error(e);
+  }
+}
+
+startCamera();
+
+// محاسبه Sobel (گرادیان) روی تصویر مقیاس‌دهی شده
+function computeSobelGray(image, w, h) {
+  // image: Uint8ClampedArray RGBA from canvas.getImageData
+  const gray = new Float32Array(w*h);
+  for (let y=0, i=0; y<h; y++) {
+    for (let x=0; x<w; x++, i++) {
+      const idx = (y*w + x)*4;
+      // grayscale (luma)
+      const r = image[idx], g = image[idx+1], b = image[idx+2];
+      gray[i] = 0.299*r + 0.587*g + 0.114*b;
+    }
+  }
+  const gx = new Float32Array(w*h);
+  const gy = new Float32Array(w*h);
+  // Sobel kernels
+  for (let y=1; y<h-1; y++) {
+    for (let x=1; x<w-1; x++) {
+      const i = y*w + x;
+      // horizontal
+      gx[i] = (
+        -1*gray[i - w - 1] + 1*gray[i - w + 1]
+        -2*gray[i - 1]     + 2*gray[i + 1]
+        -1*gray[i + w - 1] + 1*gray[i + w + 1]
+      );
+      gy[i] = (
+        1*gray[i - w - 1] + 2*gray[i - w] + 1*gray[i - w + 1]
+        -1*gray[i + w - 1] -2*gray[i + w] -1*gray[i + w + 1]
+      );
+    }
+  }
+  const mag = new Float32Array(w*h);
+  const ori = new Float32Array(w*h);
+  for (let i=0; i<w*h; i++) {
+    const gxx = gx[i], gyy = gy[i];
+    mag[i] = Math.hypot(gxx, gyy);
+    ori[i] = Math.atan2(gyy, gxx); // radians
+  }
+  return { gray, gx, gy, mag, ori };
+}
+
+// استخراج edgels در گرید درشت
+function extractEdgels(sobel, w, h, gridStep, thr) {
+  const edgels = [];
+  for (let y = Math.floor(gridStep/2); y < h; y += gridStep) {
+    for (let x = Math.floor(gridStep/2); x < w; x += gridStep) {
+      const i = y*w + x;
+      const m = sobel.mag[i];
+      if (m >= thr) {
+        // local maxima check in small neighborhood
+        let isMax = true;
+        for (let yy = -1; yy <= 1 && isMax; yy++) {
+          for (let xx = -1; xx <= 1; xx++) {
+            const nx = x+xx, ny = y+yy;
+            if (nx>=0 && nx<w && ny>=0 && ny<h) {
+              if (sobel.mag[ny*w+nx] > m) { isMax=false; break; }
+            }
+          }
+        }
+        if (isMax) {
+          edgels.push({
+            x, y,
+            mag: m,
+            ori: sobel.ori[i] // rad
+          });
+        }
+      }
+    }
+  }
+  return edgels;
+}
+
+// RANSAC برای پیدا کردن خطوط از edgels
+function ransacLinesFromEdgels(edgels, params) {
+  const lines = [];
+  const pts = edgels.slice(); // باقی‌مانده edgels
+  const maxIter = params.ransacIters;
+  const supportDist = params.supportDist;
+  const supportAngle = params.supportAngleDeg * Math.PI/180;
+
+  // برای سرعت، محدودیت تعداد edgels ورودی
+  const maxEdgels = 1200;
+  if (pts.length > maxEdgels) {
+    // ترتیب بر اساس شدت
+    pts.sort((a,b)=>b.mag - a.mag);
+    pts.length = maxEdgels;
+  }
+
+  let attempts = 0;
+  while (pts.length > 6 && lines.length < params.maxLines && attempts < 1000) {
+    attempts++;
+    let bestLine = null;
+    let bestSupport = [];
+    // تکرار RANSAC
+    for (let it=0; it<maxIter; it++) {
+      // انتخاب دو نقطه متفاوت
+      const a_idx = Math.floor(Math.random()*pts.length);
+      let b_idx = Math.floor(Math.random()*pts.length);
+      if (b_idx === a_idx) continue;
+      const a = pts[a_idx], b = pts[b_idx];
+      // خط از a->b (ax + by + c = 0) به شکل نرمال
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const norm = Math.hypot(dx, dy);
+      if (norm < 1e-6) continue;
+      // خط: normal (nx, ny) = (dy, -dx) => ax + by + c
+      const nx = dy / norm, ny = -dx / norm;
+      const c = -(nx*a.x + ny*a.y);
+      // شمارش پشتیبان‌ها
+      const support = [];
+      const maxAngleDiff = supportAngle;
+      for (let i=0;i<pts.length;i++) {
+        const p = pts[i];
+        // فاصله نقطه از خط
+        const dist = Math.abs(nx*p.x + ny*p.y + c);
+        if (dist <= supportDist) {
+          // زاویه هماهنگ (تابع orientation خط)
+          // جهت خط angleLine = atan2(dy,dx)
+          const angleLine = Math.atan2(dy, dx);
+          // orientation edgel ~= angleLine or opposite (180°)
+          let diff = Math.abs(normalizeAngle(p.ori - angleLine));
+          diff = Math.min(diff, Math.abs(Math.PI - diff)); // account for 180°
+          if (diff <= maxAngleDiff) support.push({p, dist});
+        }
+      }
+      if (support.length > bestSupport.length) {
+        bestSupport = support;
+        bestLine = { nx, ny, c, dx, dy, a, b };
+      }
+    } // end RANSAC iterations
+
+    if (!bestLine || bestSupport.length < params.minSupport) break;
+
+    // ذخیره خطِ یافت‌شده
+    // محاسبه خط به شکل (point, dir)
+    // compute average point and direction (PCA-like)
+    const ptsSupp = bestSupport.map(s=>s.p);
+    const mean = ptsSupp.reduce((acc,p)=>{ acc.x+=p.x; acc.y+=p.y; return acc; }, {x:0,y:0});
+    mean.x /= ptsSupp.length; mean.y /= ptsSupp.length;
+    // direction via average orientation
+    let vx=0, vy=0;
+    for (const p of ptsSupp) {
+      const angle = Math.atan2(bestLine.dy, bestLine.dx);
+      vx += Math.cos(angle); vy += Math.sin(angle);
+    }
+    const dirNorm = Math.hypot(vx,vy) || 1;
+    const dir = { x: vx/dirNorm, y: vy/dirNorm };
+
+    // find endpoints projecting supports onto line
+    let minProj = Infinity, maxProj = -Infinity;
+    for (const p of ptsSupp) {
+      const proj = ( (p.x - mean.x)*dir.x + (p.y - mean.y)*dir.y );
+      if (proj < minProj) minProj = proj;
+      if (proj > maxProj) maxProj = proj;
+    }
+    const p1 = { x: mean.x + dir.x*minProj, y: mean.y + dir.y*minProj };
+    const p2 = { x: mean.x + dir.x*maxProj, y: mean.y + dir.y*maxProj };
+
+    lines.push({
+      p1, p2, dir, supports: ptsSupp.slice(), score: ptsSupp.length
+    });
+
+    // حذف supporting edgels از pts
+    const toRemove = new Set(ptsSupp.map(p=>p));
+    const newPts = [];
+    for (const p of pts) {
+      if (!toRemove.has(p)) newPts.push(p);
+    }
+    pts.length = 0; pts.push(...newPts);
+  } // end while
+
+  return lines;
+}
+
+// merge خطوط نزدیک و با زاویه مشابه
+function mergeLines(lines) {
+  const merged = [];
+  const used = new Array(lines.length).fill(false);
+  function angleOf(l){ return Math.atan2(l.p2.y - l.p1.y, l.p2.x - l.p1.x); }
+  for (let i=0;i<lines.length;i++) {
+    if (used[i]) continue;
+    let L = lines[i];
+    for (let j=i+1;j<lines.length;j++) {
+      if (used[j]) continue;
+      const M = lines[j];
+      // زاویه تفاوت
+      const ai = angleOf(L), aj = angleOf(M);
+      let diff = Math.abs(normalizeAngle(ai-aj));
+      diff = Math.min(diff, Math.abs(Math.PI - diff));
+      if (diff < (15*Math.PI/180)) {
+        // فاصله دو خطوط (فاصله بین میانه‌ها)
+        const mid1 = { x:(L.p1.x+L.p2.x)/2, y:(L.p1.y+L.p2.y)/2 };
+        const mid2 = { x:(M.p1.x+M.p2.x)/2, y:(M.p1.y+M.p2.y)/2 };
+        const d = Math.hypot(mid1.x-mid2.x, mid1.y-mid2.y);
+        if (d < 40) {
+          // merge by taking min/max projection onto averaged direction
+          const dir = { x: ( (L.dir.x + M.dir.x)/2 ), y: ( (L.dir.y + M.dir.y)/2 ) };
+          const mean = { x: (mid1.x+mid2.x)/2, y:(mid1.y+mid2.y)/2 };
+          // collect endpoints
+          const pts = [L.p1, L.p2, M.p1, M.p2];
+          let minP=Infinity, maxP=-Infinity;
+          for (const p of pts) {
+            const proj = ( (p.x - mean.x)*dir.x + (p.y - mean.y)*dir.y );
+            if (proj < minP) minP = proj;
+            if (proj > maxP) maxP = proj;
+          }
+          const np1 = { x: mean.x + dir.x*minP, y: mean.y + dir.y*minP };
+          const np2 = { x: mean.x + dir.x*maxP, y: mean.y + dir.y*maxP };
+          L = { p1: np1, p2: np2, dir: {x:dir.x/Math.hypot(dir.x,dir.y), y:dir.y/Math.hypot(dir.x,dir.y)}, supports: L.supports.concat(M.supports) };
+          used[j]=true;
+        }
+      }
+    }
+    merged.push(L);
+  }
+  return merged;
+}
+
+// extend خط در دو جهت تا زمانی که gradient قوی باشه (ساده شده)
+function extendLine(line, sobel, w, h) {
+  // direction normalized
+  const dir = line.dir;
+  const step = 1.5; // pixel step for extension
+  function extendEnd(pt, sign) {
+    let cur = { x: pt.x, y: pt.y };
+    for (let k=0;k<200;k++) {
+      cur.x += dir.x * step * sign;
+      cur.y += dir.y * step * sign;
+      const ix = Math.round(cur.x), iy = Math.round(cur.y);
+      if (ix <= 1 || ix >= w-2 || iy <=1 || iy >= h-2) break;
+      const mag = sobel.mag[iy*w + ix];
+      if (mag < 5) break;
+      // otherwise continue
+    }
+    return cur;
+  }
+  const np1 = extendEnd(line.p1, -1);
+  const np2 = extendEnd(line.p2, +1);
+  return { p1: np1, p2: np2, dir: line.dir, supports: line.supports };
+}
+
+// intersect دو خط (p1-p2) و (p3-p4)
+function intersectSegs(p1,p2,p3,p4) {
+  const x1=p1.x, y1=p1.y, x2=p2.x, y2=p2.y;
+  const x3=p3.x, y3=p3.y, x4=p4.x, y4=p4.y;
+  const denom = (x1-x2)*(y3-y4) - (y1-y2)*(x3-x4);
+  if (Math.abs(denom) < 1e-6) return null;
+  const px = ((x1*y2 - y1*x2)*(x3-x4) - (x1-x2)*(x3*y4 - y3*x4)) / denom;
+  const py = ((x1*y2 - y1*x2)*(y3-y4) - (y1-y2)*(x3*y4 - y3*x4)) / denom;
+  return { x: px, y: py };
+}
+
+// بررسی چهارگوش بودن و ترتیب نقاط (ساده)
+function orderQuad(points) {
+  // points: array of 4 {x,y}
+  // محاسبه مرکز و مرتب‌سازی بر اساس زاویه از مرکز
+  const cx = (points[0].x + points[1].x + points[2].x + points[3].x)/4;
+  const cy = (points[0].y + points[1].y + points[2].y + points[3].y)/4;
+  const withAngle = points.map(p => ({p, a: Math.atan2(p.y - cy, p.x - cx)}));
+  withAngle.sort((A,B)=>A.a - B.a);
+  return withAngle.map(obj=>obj.p);
+}
+
+function isConvexQuad(pts) {
+  // simple convex check using cross products
+  let pos=false, neg=false;
+  for (let i=0;i<4;i++) {
+    const a = pts[i], b = pts[(i+1)%4], c = pts[(i+2)%4];
+    const cross = (b.x - a.x)*(c.y - b.y) - (b.y - a.y)*(c.x - b.x);
+    if (cross > 0) pos = true;
+    if (cross < 0) neg = true;
+  }
+  return !(pos && neg);
+}
+
+function normalizeAngle(a) {
+  // normalize to [0, 2PI)
+  let v = a % (2*Math.PI);
+  if (v < 0) v += 2*Math.PI;
+  return v;
+}
+
+// یافتن چهارضلعی‌ها از خطوط
+function findQuadsFromLines(lines) {
+  const quads = [];
+  // تمام زوج‌های خط را تقاطع کن و سپس ترکیبات چهار تایی بساز (روش خام اما برای تعداد کم خطوط قابل)
+  for (let i=0;i<lines.length;i++){
+    for (let j=i+1;j<lines.length;j++){
+      for (let k=j+1;k<lines.length;k++){
+        for (let l=k+1;l<lines.length;l++){
+          // از 4 خط، باید 4 گوشه با تقاطع بدست آورد
+          const L = [lines[i], lines[j], lines[k], lines[l]];
+          // امتحان همه‌ی ترتیب‌های 4 تایی از خطوط و انتخاب گوشه‌ها
+          // روش ساده: برای هر ترتیب خط‌ها، تقاطع متوالی (L0∩L1, L1∩L2, L2∩L3, L3∩L0)
+          const perms = permutations([0,1,2,3]);
+          for (const perm of perms) {
+            const pts = [];
+            let ok = true;
+            for (let t=0;t<4;t++) {
+              const a = L[perm[t]];
+              const b = L[perm[(t+1)%4]];
+              const p = intersectSegs(a.p1, a.p2, b.p1, b.p2);
+              if (!p) { ok=false; break; }
+              pts.push(p);
+            }
+            if (!ok) continue;
+            // ترتیب نقاط و بررسی تقارن/convex
+            const ordered = orderQuad(pts);
+            if (!isConvexQuad(ordered)) continue;
+            // مساحت متوسط > threshold
+            const area = polygonArea(ordered);
+            if (Math.abs(area) < 200) continue;
+            // طول اضلاع متوازن (نه خیلی کوچک و نه خیلی نامتوازن)
+            const lens = [];
+            for (let m=0;m<4;m++){
+              const a = ordered[m], b = ordered[(m+1)%4];
+              lens.push(Math.hypot(a.x-b.x, a.y-b.y));
+            }
+            const minL = Math.min(...lens), maxL = Math.max(...lens);
+            if (minL < 10) continue;
+            if (maxL/minL > 6) continue;
+            // اضافه کن
+            quads.push({ pts: ordered, area, lines: [i,j,k,l]});
+          }
+        }
+      }
+    }
+  }
+  // حذف مضاعف‌ها با بررسی شباهت گوشه‌ها
+  const unique = [];
+  for (const q of quads) {
+    let dup = false;
+    for (const u of unique) {
+      let dsum = 0;
+      for (let i=0;i<4;i++) dsum += Math.hypot(q.pts[i].x - u.pts[i].x, q.pts[i].y - u.pts[i].y);
+      if (dsum < 40) { dup=true; break; }
+    }
+    if (!dup) unique.push(q);
+  }
+  return unique;
+}
+
+// کمکی‌ها
+function polygonArea(pts) {
+  let a = 0;
+  for (let i=0;i<pts.length;i++){
+    const j = (i+1)%pts.length;
+    a += pts[i].x * pts[j].y - pts[j].x * pts[i].y;
+  }
+  return 0.5 * a;
+}
+function permutations(arr) {
+  const res = [];
+  function perm(curr, rest) {
+    if (rest.length===0) { res.push(curr.slice()); return; }
+    for (let i=0;i<rest.length;i++){
+      curr.push(rest[i]);
+      const next = rest.slice(0,i).concat(rest.slice(i+1));
+      perm(curr, next);
+      curr.pop();
+    }
+  }
+  perm([], arr);
+  return res;
+}
+
+// تبدیل مختصات از پردازش (scaled) به نمایش (canvas)
+function scalePoint(p, scale, dx, dy) {
+  return { x: p.x*scale + dx, y: p.y*scale + dy };
+}
+
+// حلقه پردازش فریم
+let lastTime = performance.now();
+async function processFrame() {
+  if (video.readyState < 2) { requestAnimationFrame(processFrame); return; }
+  // اندازه canvas برابر اندازه viewport
+  drawCanvas.width = video.videoWidth;
+  drawCanvas.height = video.videoHeight;
+  ctx.drawImage(video, 0, 0, drawCanvas.width, drawCanvas.height);
+
+  const p = params();
+  // برای پردازش، تصویر را مقیاس می‌کنیم تا سرعت بیشتر شود
+  const scale = Math.min(1, p.targetWidth / drawCanvas.width);
+  const procW = Math.max(64, Math.round(drawCanvas.width * scale));
+  const procH = Math.max(48, Math.round(drawCanvas.height * scale));
+
+  // ساخت canvas موقت برای پردازش
+  const tmp = document.createElement('canvas');
+  tmp.width = procW; tmp.height = procH;
+  const tctx = tmp.getContext('2d');
+  tctx.drawImage(video, 0, 0, procW, procH);
+  const imgData = tctx.getImageData(0,0,procW,procH);
+
+  // Sobel و edgels
+  const sobel = computeSobelGray(imgData.data, procW, procH);
+  const edgels = extractEdgels(sobel, procW, procH, p.gridStep, p.edgelThreshold);
+
+  // RANSAC خطوط
+  const ransacParams = {
+    ransacIters: p.ransacIters,
+    supportDist: 3.0,
+    supportAngleDeg: 22,
+    minSupport: p.minSupport,
+    maxLines: p.maxLines
+  };
+  const rawLines = ransacLinesFromEdgels(edgels, ransacParams);
+  const merged = mergeLines(rawLines);
+  const extended = merged.map(l => extendLine(l, sobel, procW, procH));
+
+  // تبدیل خطوط به مختصات اصلی canvas (نمایش)
+  const scaleInv = (drawCanvas.width / procW);
+  const linesDisplay = extended.map(l => ({
+    p1: { x: l.p1.x * scaleInv, y: l.p1.y * scaleInv },
+    p2: { x: l.p2.x * scaleInv, y: l.p2.y * scaleInv },
+    dir: l.dir
+  }));
+
+  // یافتن چهارگوش‌ها (روی فضای پردازش شده) — برای دقت محاسباتی از خطوط در فضای پردازش استفاده می‌کنیم
+  const extendedDisplayScaledBack = extended.map(l => ({
+    p1: { x: l.p1.x, y: l.p1.y },
+    p2: { x: l.p2.x, y: l.p2.y },
+    dir: l.dir
+  }));
+  const quads = findQuadsFromLines(extendedDisplayScaledBack);
+
+  // رسم نتایج روی canvas
+  ctx.clearRect(0,0,drawCanvas.width, drawCanvas.height);
+  ctx.drawImage(video, 0, 0, drawCanvas.width, drawCanvas.height);
+
+  // رسم خطوط
+  ctx.lineWidth = 3;
+  for (const L of linesDisplay) {
+    ctx.strokeStyle = 'rgba(0,200,255,0.9)';
+    ctx.beginPath();
+    ctx.moveTo(L.p1.x, L.p1.y);
+    ctx.lineTo(L.p2.x, L.p2.y);
+    ctx.stroke();
+    // نشانگر جهت
+    ctx.fillStyle = 'rgba(0,200,255,0.9)';
+    ctx.beginPath();
+    ctx.arc((L.p1.x+L.p2.x)/2, (L.p1.y+L.p2.y)/2, 3,0,Math.PI*2);
+    ctx.fill();
+  }
+
+  // رسم edgels (در حالت debug)
+  if (debug) {
+    ctx.fillStyle = 'yellow';
+    for (const e of edgels) {
+      ctx.fillRect(e.x*scaleInv-1, e.y*scaleInv-1, 3,3);
+    }
+  }
+
+  // رسم چهارگوش‌ها و نمایش مختصات (ترجمه به ابعاد نمایش)
+  const foundQuads = [];
+  ctx.lineWidth = 4;
+  for (const q of quads) {
+    // q.pts در فضای پردازش -> تبدیل به نمایش
+    const ptsDisp = q.pts.map(pt => ({ x: pt.x * scaleInv, y: pt.y * scaleInv }));
+    // رسم
+    ctx.strokeStyle = 'rgba(255,80,50,0.95)';
+    ctx.beginPath();
+    ctx.moveTo(ptsDisp[0].x, ptsDisp[0].y);
+    for (let i=1;i<4;i++) ctx.lineTo(ptsDisp[i].x, ptsDisp[i].y);
+    ctx.closePath(); ctx.stroke();
+    // گوشه‌ها
+    ctx.fillStyle = 'rgba(255,200,0,0.95)';
+    for (const pnt of ptsDisp) {
+      ctx.beginPath(); ctx.arc(pnt.x, pnt.y, 6,0,Math.PI*2); ctx.fill();
+    }
+    foundQuads.push(ptsDisp);
+  }
+
+  // نمایش مختصات اولین چهارگوش (اگر موجود)
+  if (foundQuads.length > 0) {
+    const q = foundQuads[0];
+    coordsDiv.innerText = `Corners:\n` +
+      `TL (${Math.round(q[0].x)}, ${Math.round(q[0].y)})\n` +
+      `TR (${Math.round(q[1].x)}, ${Math.round(q[1].y)})\n` +
+      `BR (${Math.round(q[2].x)}, ${Math.round(q[2].y)})\n` +
+      `BL (${Math.round(q[3].x)}, ${Math.round(q[3].y)})\n`;
+  } else {
+    coordsDiv.innerText = 'QR/Marker یافت نشد...';
+  }
+
+  // fps و وضعیت
+  const now = performance.now();
+  const dt = now - lastTime; lastTime = now;
+  const fps = (1000/dt).toFixed(1);
+  status.innerText = `edgels:${edgels.length} lines:${linesDisplay.length} quads:${foundQuads.length}  fps:${fps}`;
+
+  requestAnimationFrame(processFrame);
+}
+
+</script>
+</body>
+</html>
