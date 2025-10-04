@@ -58,8 +58,8 @@ toggleDebugBtn.onclick = () => { debug = !debug; };
 // تنظیمات پردازش (قابل تغییر با UI)
 function params() {
   return {
-    targetWidth: 360,           // اندازه مقیاس برای پردازش (برای سرعت)
-    gridStep: parseInt(gridRange.value,10), // اندازه‌ی گرید coarse
+    targetWidth: 640,           // اندازه مقیاس برای پردازش (برای سرعت)
+    gridStep: parseInt(gridRange.value,8), // اندازه‌ی گرید coarse
     edgelThreshold: parseInt(edgelThrInput.value,10), // آستانه قدرتمند بودن گرادیان
     ransacIters: parseInt(ransacIterInput.value,10), // تعداد تکرار RANSAC
     supportDist: 3.0,           // فاصله پشتیبان (پیکسل در مقیاس پردازش)
