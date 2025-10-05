@@ -2,7 +2,7 @@
 <html lang="fa">
 <head>
 <meta charset="utf-8"/>
-<title>Hirzer AR — Final</title>
+<title>Hirzer AR — Stabilized</title>
 <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
 <style>
   body{margin:0;background:#111;color:#eee;font-family:system-ui,-apple-system,Segoe UI,Roboto,'Helvetica Neue',Arial}
@@ -45,11 +45,9 @@
   </div>
 
 <script>
-/* hirzer_final.html
-   Clean single-file implementation:
-   - edge -> ransac lines -> filter/extend -> robust quad validation
-   - prints coords to UI when quad found
-   - no duplicate declarations, minimal globals
+/* hirzer_stable.html
+   Adds temporal locking & smoothing to reduce jumps.
+   Save as hirzer_stable.html and run (localhost or GitHub Pages HTTPS).
 */
 
 const video = document.getElementById('video');
@@ -57,7 +55,6 @@ const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
 const smap = document.getElementById('smap');
 const sctx = smap.getContext('2d');
-
 const status = document.getElementById('status');
 const statsDiv = document.getElementById('stats');
 const coordsDiv = document.getElementById('coords');
@@ -105,16 +102,16 @@ async function startCamera(){
 }
 startCamera();
 
-// ---- image processing helpers ----
+/* ---------- image processing (same as before, optimized) ---------- */
 function computeSobel(data,w,h){
   const gray = new Float32Array(w*h);
   for(let i=0;i<w*h;i++){
-    const idx = i*4; gray[i] = 0.299*data[idx] + 0.587*data[idx+1] + 0.114*data[idx+2];
+    const idx=i*4; gray[i] = 0.299*data[idx] + 0.587*data[idx+1] + 0.114*data[idx+2];
   }
   const gx = new Float32Array(w*h), gy = new Float32Array(w*h), mag = new Float32Array(w*h);
   for(let y=1;y<h-1;y++){
     for(let x=1;x<w-1;x++){
-      const i = y*w + x;
+      const i=y*w + x;
       gx[i] = -gray[i-w-1] + gray[i-w+1] - 2*gray[i-1] + 2*gray[i+1] - gray[i+w-1] + gray[i+w+1];
       gy[i] =  gray[i-w-1] + 2*gray[i-w] + gray[i-w+1] - gray[i+w-1] - 2*gray[i+w] - gray[i+w+1];
       mag[i] = Math.hypot(gx[i], gy[i]);
@@ -130,7 +127,6 @@ function extractEdgels(sobel,w,h,step,thr){
       const i = y*w + x;
       const m = sobel.mag[i] || 0;
       if(m >= thr){
-        // local maxima in 3x3
         let isMax = true;
         for(let yy=-1; yy<=1 && isMax; yy++){
           for(let xx=-1; xx<=1; xx++){
@@ -177,7 +173,6 @@ function ransacLines(edgels, params){
     }
 
     if(support.length >= minSup){
-      // compute mean and endpoints along direction
       const mean = support.reduce((ac,p)=>{ac.x+=p.x;ac.y+=p.y;return ac;},{x:0,y:0});
       mean.x /= support.length; mean.y /= support.length;
       const dir = {x: dx/norm, y: dy/norm};
@@ -191,7 +186,6 @@ function ransacLines(edgels, params){
       const p2 = { x: mean.x + dir.x*maxProj, y: mean.y + dir.y*maxProj };
       const length = Math.hypot(p2.x - p1.x, p2.y - p1.y);
       lines.push({p1,p2,dir,length,supportCount: support.length});
-      // remove support points to avoid reusing same line
       const supSet = new Set(support);
       const newPts = [];
       for(const p of pts) if(!supSet.has(p)) newPts.push(p);
@@ -199,7 +193,7 @@ function ransacLines(edgels, params){
     }
   }
 
-  lines.sort((A,B)=> (B.supportCount*A.length ? B.supportCount*B.length : B.supportCount) - (A.supportCount*A.length ? A.supportCount*A.length : A.supportCount));
+  lines.sort((A,B)=> (B.supportCount*(B.length||1)) - (A.supportCount*(A.length||1)));
   return lines.slice(0, Math.min(lines.length, 14));
 }
 
@@ -238,44 +232,64 @@ function orderQuad(points){
   return points.map(p=>({p,ang:Math.atan2(p.y-cy, p.x-cx)})).sort((A,B)=>A.ang-B.ang).map(o=>o.p);
 }
 function polygonArea(pts){ let a=0; for(let i=0;i<pts.length;i++){ const j=(i+1)%pts.length; a += pts[i].x*pts[j].y - pts[j].x*pts[i].y; } return 0.5*a; }
-function isConvex(pts){
-  let pos=false, neg=false;
-  for(let i=0;i<pts.length;i++){
-    const a=pts[i], b=pts[(i+1)%pts.length], c=pts[(i+2)%pts.length];
-    const cross = (b.x - a.x)*(c.y - b.y) - (b.y - a.y)*(c.x - b.x);
-    if(cross > 0) pos=true; if(cross < 0) neg=true;
-  }
-  return !(pos && neg);
-}
+function isConvex(pts){ let pos=false, neg=false; for(let i=0;i<pts.length;i++){ const a=pts[i], b=pts[(i+1)%pts.length], c=pts[(i+2)%pts.length]; const cross = (b.x - a.x)*(c.y - b.y) - (b.y - a.y)*(c.x - b.x); if(cross > 0) pos=true; if(cross < 0) neg=true; } return !(pos && neg); }
 
-// single lastTime for FPS
+// ---------- temporal stabilization state ----------
 let lastTime = performance.now();
+let locked = false;                 // whether we are locked on a quad
+let lockCount = 0;                  // consecutive detections that agree
+const lockThreshold = 3;            // need this many consecutive similar detections to lock
+let lostCount = 0;                  // consecutive missed frames while locked
+const loseTimeout = 8;              // frames to lose lock
+let lastDetectedBBox = null;        // bbox of last detection (proc coords)
+let lastDetectedCorners = null;     // last detected corners (proc coords)
+let smoothedCorners = null;         // smoothed corners (proc coords)
+let velocity = null;                // simple velocity for prediction
+const alpha = 0.6;                  // EMA factor (0..1) higher => more weight to new detections
+const iouThreshold = 0.25;          // IoU threshold for "same" detection
+const predictWhenLost = true;       // whether to predict position when detection missing
+
+function bboxFromPts(pts){
+  let minx=Infinity, miny=Infinity, maxx=-Infinity, maxy=-Infinity;
+  for(const p of pts){ if(p.x<minx) minx=p.x; if(p.y<miny) miny=p.y; if(p.x>maxx) maxx=p.x; if(p.y>maxy) maxy=p.y; }
+  return {minx,miny,maxx,maxy};
+}
+function iouBoxes(a,b){
+  if(!a || !b) return 0;
+  const ix = Math.max(0, Math.min(a.maxx,b.maxx) - Math.max(a.minx,b.minx));
+  const iy = Math.max(0, Math.min(a.maxy,b.maxy) - Math.max(a.miny,b.miny));
+  const inter = ix * iy;
+  const aarea = Math.max(0, a.maxx - a.minx) * Math.max(0, a.maxy - a.miny);
+  const barea = Math.max(0, b.maxx - b.minx) * Math.max(0, b.maxy - b.miny);
+  const union = aarea + barea - inter;
+  if(union <= 0) return 0;
+  return inter/union;
+}
+function avgPoints(a,b,alphaBlend){
+  return a.map((p,i)=>({ x: alphaBlend * b[i].x + (1-alphaBlend) * a[i].x, y: alphaBlend * b[i].y + (1-alphaBlend) * a[i].y }));
+}
 
 // main loop
 function loop(){
   if(video.readyState < 2){ requestAnimationFrame(loop); return; }
 
-  // draw video to canvas (full resolution)
   canvas.width = video.videoWidth;
   canvas.height = video.videoHeight;
   ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-  // parameters
   const pW = parseInt(targetW.value,10);
   const scale = Math.min(1, pW / canvas.width);
   const procW = Math.max(160, Math.round(canvas.width * scale));
   const procH = Math.max(120, Math.round(canvas.height * scale));
 
-  // temp canvas for processing
   const tmp = document.createElement('canvas'); tmp.width = procW; tmp.height = procH;
   const tctx = tmp.getContext('2d');
   tctx.drawImage(video, 0, 0, procW, procH);
   const img = tctx.getImageData(0,0,procW,procH);
 
-  // sobel
   const sobel = computeSobel(img.data, procW, procH);
 
-  // small sobel map
+  // draw sobel mini
   const smW = smap.width = Math.min(140, procW);
   const smH = smap.height = Math.min(100, procH);
   const smImg = sctx.createImageData(smW, smH);
@@ -289,26 +303,23 @@ function loop(){
   }
   sctx.putImageData(smImg, 0, 0);
 
-  // edgels
+  // edgels & lines
   const gs = Math.max(4, parseInt(gridStep.value,10));
   const thr = Math.max(4, parseFloat(edgelThr.value));
   const edgels = extractEdgels(sobel, procW, procH, gs, thr);
 
-  // RANSAC for lines
   const rparams = { ransacIters: parseInt(ransacIter.value,10), minSupport: parseInt(minSupport.value,10), maxLines: 18, supportDist:3 };
   const rawLines = ransacLines(edgels, rparams);
 
-  // filter lines by length to remove internal small lines
   const minLen = Math.max(30, procW * 0.08);
   const longLines = rawLines.filter(l => l.length >= minLen);
   const topLines = longLines.slice(0, 12);
 
-  // extend lines
   const extended = topLines.map(l => extendLine(l, sobel, procW, procH));
 
-  // robust quad detection
+  // robust quad detection (only from topLines) - require in-bounds & angle checks
   const quads = [];
-  const inBounds = (p) => (p && p.x>=0 && p.y>=0 && p.x<procW && p.y<procH);
+  const inBounds = p => (p && p.x>=0 && p.y>=0 && p.x<procW && p.y<procH);
 
   for(let i=0;i<extended.length;i++){
     for(let j=i+1;j<extended.length;j++){
@@ -317,11 +328,10 @@ function loop(){
           const L = [extended[i], extended[j], extended[k], extended[m]];
           const pts = [];
           let ok = true;
-          // compute sequential intersections L0∩L1, L1∩L2, L2∩L3, L3∩L0
           for(let t=0;t<4;t++){
             const a = L[t], b = L[(t+1)%4];
             const p = intersect(a.p1, a.p2, b.p1, b.p2);
-            if(!p || !inBounds(p)) { ok=false; break; }
+            if(!p || !inBounds(p)){ ok=false; break; }
             pts.push(p);
           }
           if(!ok) continue;
@@ -329,16 +339,12 @@ function loop(){
           if(!isConvex(ordered)) continue;
           const area = Math.abs(polygonArea(ordered));
           if(area < Math.max(400, (procW*procH)*0.004)) continue;
-          // side length and aspect checks
-          const lens = [];
-          for(let ii=0; ii<4; ii++){
-            const a = ordered[ii], b = ordered[(ii+1)%4];
-            lens.push(Math.hypot(a.x-b.x, a.y-b.y));
-          }
+          const lens = []; for(let ii=0;ii<4;ii++){ const a=ordered[ii], b=ordered[(ii+1)%4]; lens.push(Math.hypot(a.x-b.x,a.y-b.y)); }
           const minL = Math.min(...lens), maxL = Math.max(...lens);
           if(minL < 20) continue;
-          if(maxL / minL > 3.5) continue;
-          // angles close to 90 deg
+          if(maxL/minL > 3.5) continue;
+
+          // angle check
           let angleOK = true;
           for(let ii=0; ii<4; ii++){
             const a = ordered[ii], b = ordered[(ii+1)%4], c = ordered[(ii+2)%4];
@@ -356,13 +362,79 @@ function loop(){
     }
   }
 
+  // choose best detection (largest area)
+  let detected = null;
+  if(quads.length > 0){
+    quads.sort((a,b)=>b.area - a.area);
+    detected = quads[0].pts; // in proc coords
+  }
+
+  // compute bbox and IoU with lastDetectedBBox
+  let detectedBBox = null;
+  if(detected) detectedBBox = bboxFromPts(detected);
+
+  let iou = 0;
+  if(detectedBBox && lastDetectedBBox) iou = iouBoxes(detectedBBox, lastDetectedBBox);
+
+  // LOCK / UNLOCK logic
+  if(detected && (lastDetectedBBox == null || iou >= iouThreshold)){
+    lockCount++;
+  } else {
+    lockCount = 0;
+  }
+
+  if(!locked){
+    if(lockCount >= lockThreshold){
+      locked = true;
+      lostCount = 0;
+      // initialize smoothedCorners & velocity
+      smoothedCorners = detected.map(p => ({x:p.x, y:p.y}));
+      velocity = Array(4).fill().map(()=>({x:0,y:0}));
+      lastDetectedCorners = detected.map(p=>({x:p.x,y:p.y}));
+      lastDetectedBBox = detectedBBox;
+      console.log('Locked on quad');
+    }
+  } else {
+    // already locked
+    if(detected && iou >= iouThreshold){
+      // update smoothed using EMA
+      const newSm = smoothedCorners.map((prev,i)=>({
+        x: alpha * detected[i].x + (1-alpha) * prev.x,
+        y: alpha * detected[i].y + (1-alpha) * prev.y
+      }));
+      // velocity = newSm - prev
+      velocity = newSm.map((p,i)=>({ x: p.x - smoothedCorners[i].x, y: p.y - smoothedCorners[i].y }));
+      smoothedCorners = newSm;
+      lastDetectedCorners = detected.map(p=>({x:p.x,y:p.y}));
+      lastDetectedBBox = detectedBBox;
+      lostCount = 0;
+    } else {
+      // detection missing or mismatch: predict using velocity
+      if(predictWhenLost && smoothedCorners){
+        smoothedCorners = smoothedCorners.map((p,i)=>({ x: p.x + (velocity[i] ? velocity[i].x : 0), y: p.y + (velocity[i] ? velocity[i].y : 0) }));
+      }
+      lostCount++;
+      if(lostCount > loseTimeout){
+        // unlock after continuous misses
+        locked = false;
+        lockCount = 0;
+        lastDetectedBBox = null;
+        lastDetectedCorners = null;
+        smoothedCorners = null;
+        velocity = null;
+        lostCount = 0;
+        console.log('Unlock due to lost');
+      }
+    }
+  }
+
   // draw
   ctx.clearRect(0,0,canvas.width,canvas.height);
   ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
   const scaleInv = canvas.width / procW;
-  // draw lines
-  ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(0,200,255,0.9)';
+  // draw extended lines (debug)
+  ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(0,200,255,0.6)';
   for(const L of extended){
     ctx.beginPath();
     ctx.moveTo(L.p1.x*scaleInv, L.p1.y*scaleInv);
@@ -370,21 +442,22 @@ function loop(){
     ctx.stroke();
   }
 
-  // draw best quad (largest area)
-  let printed = false;
-  if(quads.length > 0){
-    quads.sort((a,b)=>b.area - a.area);
-    const q = quads[0];
-    const ptsDisp = q.pts.map(p => ({ x: p.x*scaleInv, y: p.y*scaleInv }));
+  // if locked or temporary detected, draw smoothedCorners (if available) otherwise draw detected
+  let displayCorners = null;
+  if(smoothedCorners){
+    displayCorners = smoothedCorners.map(p=>({x:p.x*scaleInv, y:p.y*scaleInv}));
+  } else if(detected){
+    displayCorners = detected.map(p=>({x:p.x*scaleInv, y:p.y*scaleInv}));
+  }
+
+  if(displayCorners){
     ctx.lineWidth = 5; ctx.strokeStyle = 'rgba(255,140,20,0.98)';
-    ctx.beginPath(); ctx.moveTo(ptsDisp[0].x, ptsDisp[0].y);
-    for(let i=1;i<4;i++) ctx.lineTo(ptsDisp[i].x, ptsDisp[i].y);
+    ctx.beginPath(); ctx.moveTo(displayCorners[0].x, displayCorners[0].y);
+    for(let i=1;i<4;i++) ctx.lineTo(displayCorners[i].x, displayCorners[i].y);
     ctx.closePath(); ctx.stroke();
     ctx.fillStyle = 'yellow';
-    for(const p of ptsDisp){ ctx.beginPath(); ctx.arc(p.x,p.y,6,0,Math.PI*2); ctx.fill(); }
-    coordsDiv.innerText = `گوشه‌ها (px):\nTL (${Math.round(ptsDisp[0].x)}, ${Math.round(ptsDisp[0].y)})\nTR (${Math.round(ptsDisp[1].x)}, ${Math.round(ptsDisp[1].y)})\nBR (${Math.round(ptsDisp[2].x)}, ${Math.round(ptsDisp[2].y)})\nBL (${Math.round(ptsDisp[3].x)}, ${Math.round(ptsDisp[3].y)})`;
-    console.log('Quad corners (canvas px):', ptsDisp);
-    printed = true;
+    for(const p of displayCorners){ ctx.beginPath(); ctx.arc(p.x,p.y,6,0,Math.PI*2); ctx.fill(); }
+    coordsDiv.innerText = `گوشه‌ها (px):\nTL (${Math.round(displayCorners[0].x)}, ${Math.round(displayCorners[0].y)})\nTR (${Math.round(displayCorners[1].x)}, ${Math.round(displayCorners[1].y)})\nBR (${Math.round(displayCorners[2].x)}, ${Math.round(displayCorners[2].y)})\nBL (${Math.round(displayCorners[3].x)}, ${Math.round(displayCorners[3].y)})\nLOCKED: ${locked ? 'YES' : 'NO'}`;
   } else {
     coordsDiv.innerText = 'مختصات: (هیچ)';
   }
