@@ -2,106 +2,121 @@
 <html lang="fa">
 <head>
 <meta charset="utf-8"/>
-<title>Hirzer Debug AR (Enhanced)</title>
+<title>Hirzer AR — Fixed & Clean</title>
 <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
 <style>
-  body{margin:0;background:#111;color:#ddd;font-family:sans-serif}
-  video,#mainCanvas{position:fixed;top:0;left:0;width:100%;height:100%;object-fit:cover}
-  #ui{position:fixed;left:8px;top:8px;background:rgba(0,0,0,0.6);padding:8px;border-radius:8px;z-index:20}
-  .small{font-size:12px;color:#bbb}
-  #smap{position:fixed;right:8px;top:8px;width:140px;height:100px;border:2px solid rgba(255,255,255,0.12);z-index:20}
-  button,input[type=range]{font-size:13px}
+  body{margin:0;background:#111;color:#eee;font-family:sans-serif}
+  video, canvas{position:fixed; top:0; left:0; width:100%; height:100%; object-fit:cover}
+  #ui{position:fixed; left:8px; top:8px; z-index:30; background:rgba(0,0,0,0.6); padding:8px; border-radius:8px; min-width:220px}
+  .small{font-size:13px; color:#ccc}
+  .stat{margin-top:6px; font-family:monospace; white-space:pre;}
+  #smap{position:fixed; right:8px; top:8px; width:140px; height:100px; border:1px solid rgba(255,255,255,0.08); z-index:30}
+  input[type=range]{width:140px}
+  button{margin:3px 4px}
 </style>
 </head>
 <body>
   <video id="video" autoplay playsinline muted></video>
-  <canvas id="mainCanvas"></canvas>
+  <canvas id="canvas"></canvas>
 
   <div id="ui">
-    <div id="status">آماده‌سازی...</div>
+    <div id="status" class="small">درحال راه‌اندازی دوربین...</div>
+
     <div style="margin-top:6px">
-      <button id="presetMobile">Preset: Mobile</button>
-      <button id="presetPrinted">Preset: Printed</button>
-      <button id="captureBtn">Capture</button>
-      <button id="toggleDebug">Toggle Debug</button>
+      <button id="presetMobile">Preset Mobile</button>
+      <button id="presetPrinted">Preset Printed</button>
     </div>
-    <div style="margin-top:6px">
-      <label class="small">targetW: <span id="tv">480</span></label><br>
-      <input id="targetW" type="range" min="240" max="960" value="480">
-      <div class="small">gridStep: <span id="gs">8</span> <input id="gridStep" type="range" min="4" max="20" value="8"></div>
-      <div class="small">edgelThr: <span id="et">12</span> <input id="edgelThr" type="range" min="4" max="60" value="12"></div>
-      <div class="small">ransacIters: <span id="ri">350</span> <input id="ransacIter" type="range" min="60" max="800" value="350"></div>
-      <div class="small">minSupport: <span id="ms">10</span> <input id="minSupport" type="range" min="4" max="32" value="10"></div>
+
+    <div style="margin-top:8px" class="small">
+      targetW: <span id="tv">640</span><br>
+      <input id="targetW" type="range" min="240" max="960" value="640"><br>
+      gridStep: <span id="gs">6</span><br>
+      <input id="gridStep" type="range" min="4" max="20" value="6"><br>
+      edgelThr: <span id="et">10</span><br>
+      <input id="edgelThr" type="range" min="4" max="60" value="10"><br>
+      ransacIters: <span id="ri">600</span><br>
+      <input id="ransacIter" type="range" min="60" max="1000" value="600"><br>
+      minSupport: <span id="ms">8</span><br>
+      <input id="minSupport" type="range" min="4" max="32" value="8"><br>
     </div>
-    <div style="margin-top:8px" class="small" id="stats">edgels:0 lines:0 quads:0 fps:0</div>
+
+    <div class="stat" id="stats">edgels:0 lines:0 quads:0 fps:0</div>
+    <div class="stat" id="coords">مختصات: (هیچ)</div>
   </div>
 
   <canvas id="smap"></canvas>
 
 <script>
+/* Clean, fixed version of Hirzer-style quad detection.
+   - No duplicate declarations
+   - Prints corner coordinates in the UI when a quad is found
+*/
+
 const video = document.getElementById('video');
-const canvas = document.getElementById('mainCanvas');
+const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
 const smap = document.getElementById('smap');
 const sctx = smap.getContext('2d');
 
 const status = document.getElementById('status');
-const stats = document.getElementById('stats');
-let debugMode = false;
+const statsDiv = document.getElementById('stats');
+const coordsDiv = document.getElementById('coords');
 
 const targetW = document.getElementById('targetW');
 const gridStep = document.getElementById('gridStep');
 const edgelThr = document.getElementById('edgelThr');
 const ransacIter = document.getElementById('ransacIter');
 const minSupport = document.getElementById('minSupport');
-document.getElementById('tv').innerText = targetW.value;
-document.getElementById('gs').innerText = gridStep.value;
-document.getElementById('et').innerText = edgelThr.value;
-document.getElementById('ri').innerText = ransacIter.value;
-document.getElementById('ms').innerText = minSupport.value;
 
-[targetW,gridStep,edgelThr,ransacIter,minSupport].forEach(el=>{
-  el.oninput = ()=> {
-    document.getElementById('tv').innerText = targetW.value;
-    document.getElementById('gs').innerText = gridStep.value;
-    document.getElementById('et').innerText = edgelThr.value;
-    document.getElementById('ri').innerText = ransacIter.value;
-    document.getElementById('ms').innerText = minSupport.value;
-  };
-});
+const tv = document.getElementById('tv');
+const gs = document.getElementById('gs');
+const et = document.getElementById('et');
+const ri = document.getElementById('ri');
+const ms = document.getElementById('ms');
+
+function updateLabels(){
+  tv.innerText = targetW.value;
+  gs.innerText = gridStep.value;
+  et.innerText = edgelThr.value;
+  ri.innerText = ransacIter.value;
+  ms.innerText = minSupport.value;
+}
+[targetW,gridStep,edgelThr,ransacIter,minSupport].forEach(el=>el.oninput=updateLabels);
+updateLabels();
 
 document.getElementById('presetMobile').onclick = ()=>{
-  targetW.value=480; gridStep.value=8; edgelThr.value=12; ransacIter.value=350; minSupport.value=10; updateLabels();
+  targetW.value=480; gridStep.value=8; edgelThr.value=12; ransacIter.value=400; minSupport.value=8; updateLabels();
 };
 document.getElementById('presetPrinted').onclick = ()=>{
-  targetW.value=640; gridStep.value=6; edgelThr.value=10; ransacIter.value=450; minSupport.value=12; updateLabels();
+  targetW.value=640; gridStep.value=6; edgelThr.value=10; ransacIter.value=600; minSupport.value=10; updateLabels();
 };
-document.getElementById('toggleDebug').onclick = ()=>{ debugMode=!debugMode; };
-document.getElementById('captureBtn').onclick = captureFrame;
-
-function updateLabels(){ document.getElementById('tv').innerText=targetW.value; document.getElementById('gs').innerText=gridStep.value; document.getElementById('et').innerText=edgelThr.value; document.getElementById('ri').innerText=ransacIter.value; document.getElementById('ms').innerText=minSupport.value; }
 
 async function startCamera(){
-  try{
-    const s = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}, audio:false});
-    video.srcObject = s; await video.play();
-    status.innerText='Camera ready';
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:'environment' }, audio:false });
+    video.srcObject = stream;
+    await video.play();
+    status.innerText = 'دوربین آماده — در حال پردازش...';
     requestAnimationFrame(loop);
-  }catch(e){ status.innerText='Camera error: '+e.message; console.error(e); }
+  } catch (e) {
+    status.innerText = 'خطا در دسترسی دوربین: ' + e.message;
+    console.error(e);
+  }
 }
 startCamera();
 
-// Sobel (same as earlier but small optimization)
-function computeSobelGray(imgdata,w,h){
-  const data = imgdata; // Uint8ClampedArray RGBA
+// --- image processing helpers ---
+function computeSobel(data,w,h){
   const gray = new Float32Array(w*h);
-  for(let i=0, j=0;i<w*h;i++){ const idx=i*4; gray[i]=0.299*data[idx]+0.587*data[idx+1]+0.114*data[idx+2]; }
+  for(let i=0;i<w*h;i++){
+    const idx=i*4; gray[i] = 0.299*data[idx] + 0.587*data[idx+1] + 0.114*data[idx+2];
+  }
   const gx = new Float32Array(w*h), gy = new Float32Array(w*h), mag = new Float32Array(w*h);
   for(let y=1;y<h-1;y++){
     for(let x=1;x<w-1;x++){
-      const i=y*w+x;
-      gx[i] = -gray[i-w-1] + gray[i-w+1] -2*gray[i-1] + 2*gray[i+1] - gray[i+w-1] + gray[i+w+1];
-      gy[i] =  gray[i-w-1] + 2*gray[i-w] + gray[i-w+1] - gray[i+w-1] -2*gray[i+w] - gray[i+w+1];
+      const i=y*w + x;
+      gx[i] = -gray[i-w-1] + gray[i-w+1] - 2*gray[i-1] + 2*gray[i+1] - gray[i+w-1] + gray[i+w+1];
+      gy[i] =  gray[i-w-1] + 2*gray[i-w] + gray[i-w+1] - gray[i+w-1] - 2*gray[i+w] - gray[i+w+1];
       mag[i] = Math.hypot(gx[i], gy[i]);
     }
   }
@@ -112,15 +127,16 @@ function extractEdgels(sobel,w,h,step,thr){
   const edgels=[];
   for(let y=Math.floor(step/2); y<h; y+=step){
     for(let x=Math.floor(step/2); x<w; x+=step){
-      const i=y*w+x, m=sobel.mag[i];
-      if(m>=thr){
-        // local max
-        let isMax=true;
+      const i = y*w + x;
+      const m = sobel.mag[i] || 0;
+      if(m >= thr){
+        // local maxima check
+        let isMax = true;
         for(let yy=-1; yy<=1 && isMax; yy++){
           for(let xx=-1; xx<=1; xx++){
-            const nx=x+xx, ny=y+yy;
+            const nx = x+xx, ny = y+yy;
             if(nx>=0 && nx<w && ny>=0 && ny<h){
-              if(sobel.mag[ny*w+nx] > m){ isMax=false; break; }
+              if((sobel.mag[ny*w + nx] || 0) > m) { isMax=false; break; }
             }
           }
         }
@@ -131,189 +147,243 @@ function extractEdgels(sobel,w,h,step,thr){
   return edgels;
 }
 
-function ransacLines(edgels,params){
-  const pts = edgels.slice(); const lines=[];
-  if(pts.length>1200) pts.sort((a,b)=>b.mag-a.mag), pts.length=1200;
-  const iters = params.ransacIters; const supportDist=params.supportDist||3; const angThresh=params.supportAngle||(22*Math.PI/180);
-  while(pts.length>6 && lines.length < params.maxLines && iters>0){
-    let best=null, bestSup=[];
-    for(let it=0; it<iters; it++){
-      const aIdx=Math.floor(Math.random()*pts.length), bIdx=Math.floor(Math.random()*pts.length);
-      if(aIdx===bIdx) continue;
-      const a=pts[aIdx], b=pts[bIdx];
-      const dx=b.x-a.x, dy=b.y-a.y; const norm=Math.hypot(dx,dy); if(norm<1e-6) continue;
-      const nx=dy/norm, ny=-dx/norm, c=-(nx*a.x+ny*a.y);
-      const angleLine = Math.atan2(dy,dx);
-      const sup=[];
-      for(let i=0;i<pts.length;i++){
-        const p=pts[i]; const dist=Math.abs(nx*p.x + ny*p.y + c);
-        if(dist <= supportDist){
-          let diff = Math.abs(p.ori ? (p.ori - angleLine) : 0);
-          diff = Math.min(diff, Math.abs(Math.PI - diff));
-          if(diff <= angThresh) sup.push(p);
-        }
+// RANSAC lines
+function ransacLines(edgels, params){
+  const pts = edgels.slice();
+  if(pts.length > 1200){ pts.sort((a,b)=>b.mag-a.mag); pts.length = 1200; }
+  const lines = [];
+  const iters = Math.max(1, parseInt(params.ransacIters,10));
+  const supportDist = params.supportDist || 3.0;
+  const minSup = params.minSupport || 6;
+  const maxLines = params.maxLines || 12;
+
+  let iterCount = 0;
+  while(pts.length > 6 && lines.length < maxLines && iterCount < iters){
+    iterCount++;
+    const aIdx = Math.floor(Math.random()*pts.length);
+    let bIdx = Math.floor(Math.random()*pts.length);
+    if(bIdx === aIdx) continue;
+    const a = pts[aIdx], b = pts[bIdx];
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const norm = Math.hypot(dx,dy);
+    if(norm < 1e-6) continue;
+    const nx = dy / norm, ny = -dx / norm;
+    const c = -(nx*a.x + ny*a.y);
+
+    const support = [];
+    for(let i=0;i<pts.length;i++){
+      const p = pts[i];
+      const dist = Math.abs(nx*p.x + ny*p.y + c);
+      if(dist <= supportDist){
+        support.push(p);
       }
-      if(sup.length > bestSup.length){ bestSup = sup; best = {a,b,dx,dy}; }
     }
-    if(!best || bestSup.length < params.minSupport) break;
-    // compute mean, direction, endpoints
-    const mean = bestSup.reduce((ac,p)=>{ac.x+=p.x;ac.y+=p.y;return ac},{x:0,y:0});
-    mean.x/=bestSup.length; mean.y/=bestSup.length;
-    const dir = {x: best.dx/Math.hypot(best.dx,best.dy), y: best.dy/Math.hypot(best.dx,best.dy)};
-    let minP=Infinity, maxP=-Infinity;
-    for(const p of bestSup){ const proj = ( (p.x-mean.x)*dir.x + (p.y-mean.y)*dir.y ); if(proj<minP) minP=proj; if(proj>maxP) maxP=proj; }
-    const p1={x: mean.x + dir.x*minP, y: mean.y + dir.y*minP}, p2={x: mean.x + dir.x*maxP, y: mean.y + dir.y*maxP};
-    lines.push({p1,p2,dir,supports:bestSup});
-    // remove supports
-    const set = new Set(bestSup);
-    const newPts = []; for(const p of pts) if(!set.has(p)) newPts.push(p);
-    pts.length=0; pts.push(...newPts);
-    // safety break
-    if(lines.length>params.maxLines) break;
+
+    if(support.length >= minSup){
+      // compute mean and endpoints along direction
+      const mean = support.reduce((ac,p)=>{ac.x+=p.x;ac.y+=p.y;return ac;},{x:0,y:0});
+      mean.x /= support.length; mean.y /= support.length;
+      const dir = {x: dx/norm, y: dy/norm};
+      let minProj = Infinity, maxProj = -Infinity;
+      for(const p of support){
+        const proj = ((p.x - mean.x)*dir.x + (p.y - mean.y)*dir.y);
+        if(proj < minProj) minProj = proj;
+        if(proj > maxProj) maxProj = proj;
+      }
+      const p1 = { x: mean.x + dir.x*minProj, y: mean.y + dir.y*minProj };
+      const p2 = { x: mean.x + dir.x*maxProj, y: mean.y + dir.y*maxProj };
+      const length = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+      lines.push({p1,p2,dir,length,supportCount: support.length});
+      // remove support points
+      const supSet = new Set(support);
+      const newPts = [];
+      for(const p of pts) if(!supSet.has(p)) newPts.push(p);
+      pts.length = 0; pts.push(...newPts);
+    }
   }
-  return lines;
+
+  // sort and keep top
+  lines.sort((A,B)=> (B.supportCount*B.length) - (A.supportCount*A.length));
+  return lines.slice(0, Math.min(lines.length, 14));
+}
+
+function extendLine(line, sobel, w, h){
+  const dir = line.dir;
+  const step = 1.2;
+  let p1 = {x: line.p1.x, y: line.p1.y};
+  let p2 = {x: line.p2.x, y: line.p2.y};
+  for(let k=0;k<300;k++){
+    const nx = Math.round(p1.x - dir.x*step), ny = Math.round(p1.y - dir.y*step);
+    if(nx<=1||ny<=1||nx>=w-2||ny>=h-2) break;
+    if((sobel.mag[ny*w + nx] || 0) < 4) break;
+    p1.x = nx; p1.y = ny;
+  }
+  for(let k=0;k<300;k++){
+    const nx = Math.round(p2.x + dir.x*step), ny = Math.round(p2.y + dir.y*step);
+    if(nx<=1||ny<=1||nx>=w-2||ny>=h-2) break;
+    if((sobel.mag[ny*w + nx] || 0) < 4) break;
+    p2.x = nx; p2.y = ny;
+  }
+  return {p1,p2,dir};
 }
 
 function intersect(p1,p2,p3,p4){
   const x1=p1.x,y1=p1.y,x2=p2.x,y2=p2.y,x3=p3.x,y3=p3.y,x4=p4.x,y4=p4.y;
-  const denom=(x1-x2)*(y3-y4)-(y1-y2)*(x3-x4);
-  if(Math.abs(denom)<1e-6) return null;
-  const px = ((x1*y2-y1*x2)*(x3-x4)-(x1-x2)*(x3*y4-y3*x4))/denom;
-  const py = ((x1*y2-y1*x2)*(y3-y4)-(y1-y2)*(x3*y4-y3*x4))/denom;
-  return {x:px,y:py};
+  const denom = (x1-x2)*(y3-y4) - (y1-y2)*(x3-x4);
+  if(Math.abs(denom) < 1e-6) return null;
+  const px = ((x1*y2 - y1*x2)*(x3-x4) - (x1-x2)*(x3*y4 - y3*x4)) / denom;
+  const py = ((x1*y2 - y1*x2)*(y3-y4) - (y1-y2)*(x3*y4 - y3*x4)) / denom;
+  return {x:px, y:py};
 }
 
-function orderQuad(pts){
-  const cx=(pts[0].x+pts[1].x+pts[2].x+pts[3].x)/4;
-  const cy=(pts[0].y+pts[1].y+pts[2].y+pts[3].y)/4;
-  return pts.map(p=>({p,ang:Math.atan2(p.y-cy,p.x-cx)})).sort((a,b)=>a.ang-b.ang).map(o=>o.p);
+function orderQuad(points){
+  const cx = (points[0].x + points[1].x + points[2].x + points[3].x)/4;
+  const cy = (points[0].y + points[1].y + points[2].y + points[3].y)/4;
+  return points.map(p=>({p,ang:Math.atan2(p.y-cy, p.x-cx)})).sort((A,B)=>A.ang-B.ang).map(o=>o.p);
+}
+function polygonArea(pts){ let a=0; for(let i=0;i<pts.length;i++){ const j=(i+1)%pts.length; a += pts[i].x*pts[j].y - pts[j].x*pts[i].y; } return 0.5*a; }
+function isConvex(pts){
+  let pos=false, neg=false;
+  for(let i=0;i<pts.length;i++){
+    const a=pts[i], b=pts[(i+1)%pts.length], c=pts[(i+2)%pts.length];
+    const cross = (b.x - a.x)*(c.y - b.y) - (b.y - a.y)*(c.x - b.x);
+    if(cross > 0) pos=true; if(cross < 0) neg=true;
+  }
+  return !(pos && neg);
 }
 
-function polygonArea(pts){ let a=0; for(let i=0;i<pts.length;i++){ const j=(i+1)%pts.length; a+=pts[i].x*pts[j].y-pts[j].x*pts[i].y;} return 0.5*a; }
+// single lastTime declaration (no duplicates)
+let lastTime = performance.now();
 
-let last = performance.now();
+// main loop
 function loop(){
   if(video.readyState < 2){ requestAnimationFrame(loop); return; }
+  // draw video to canvas
   canvas.width = video.videoWidth; canvas.height = video.videoHeight;
-  ctx.drawImage(video,0,0,canvas.width,canvas.height);
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
   // processing scale
   const pW = parseInt(targetW.value,10);
   const scale = Math.min(1, pW / canvas.width);
-  const procW = Math.max(120, Math.round(canvas.width * scale));
-  const procH = Math.max(80, Math.round(canvas.height * scale));
-  const tmp = document.createElement('canvas'); tmp.width=procW; tmp.height=procH;
-  const tctx = tmp.getContext('2d'); tctx.drawImage(video,0,0,procW,procH);
+  const procW = Math.max(160, Math.round(canvas.width * scale));
+  const procH = Math.max(120, Math.round(canvas.height * scale));
+
+  // temp canvas for processing
+  const tmp = document.createElement('canvas'); tmp.width = procW; tmp.height = procH;
+  const tctx = tmp.getContext('2d');
+  tctx.drawImage(video, 0, 0, procW, procH);
   const img = tctx.getImageData(0,0,procW,procH);
 
-  const sobel = computeSobelGray(img.data, procW, procH);
-  // draw sobel magnitude small map
-  sctx.clearRect(0,0,smap.width,smap.height);
-  const smImg = sctx.createImageData(procW>140?140:procW, procH>100?100:procH);
-  // scale to inset
-  const sw = smImg.width, sh = smImg.height;
-  for(let y=0;y<sh;y++){
-    for(let x=0;x<sw;x++){
-      const sx = Math.floor(x * procW / sw), sy = Math.floor(y * procH / sh);
-      const v = Math.min(255, Math.round(sobel.mag[sy*procW + sx]));
-      const idx=(y*sw+x)*4; smImg.data[idx]=v; smImg.data[idx+1]=v; smImg.data[idx+2]=v; smImg.data[idx+3]=255;
+  // sobel
+  const sobel = computeSobel(img.data, procW, procH);
+
+  // small sobel map draw
+  const smW = smap.width = Math.min(140, procW);
+  const smH = smap.height = Math.min(100, procH);
+  const smImg = sctx.createImageData(smW, smH);
+  for(let y=0;y<smH;y++){
+    for(let x=0;x<smW;x++){
+      const sx = Math.floor(x * procW / smW), sy = Math.floor(y * procH / smH);
+      let v = Math.round(Math.min(255, sobel.mag[sy*procW + sx] || 0));
+      const idx = (y*smW + x)*4;
+      smImg.data[idx]=v; smImg.data[idx+1]=v; smImg.data[idx+2]=v; smImg.data[idx+3]=255;
     }
   }
-  sctx.putImageData(smImg,0,0);
+  sctx.putImageData(smImg, 0, 0);
 
   // edgels
   const gs = parseInt(gridStep.value,10);
   const thr = parseFloat(edgelThr.value);
   const edgels = extractEdgels(sobel, procW, procH, gs, thr);
-  // auto-lower thr if too few edgels
-  if(edgels.length < 18 && thr > 6){
-    edgelThr.value = Math.max(6, thr - 1);
-    document.getElementById('et').innerText = edgelThr.value;
-  }
 
-  // RANSAC
-  const rparams = { ransacIters: parseInt(ransacIter.value,10), minSupport: parseInt(minSupport.value,10), maxLines: 14, supportDist:3, supportAngle:22*Math.PI/180 };
-  // attach ori to edgels (approx from sobel) ~ here we set 0 (simple)
-  for(const e of edgels){ e.ori = 0; } // we skip orientation test for now to be robust
-  const lines = ransacLines(edgels, rparams);
-  // simple merge (skip complex merging for perf)
+  // RANSAC lines
+  const rparams = { ransacIters: parseInt(ransacIter.value,10), minSupport: parseInt(minSupport.value,10), maxLines: 18, supportDist:3 };
+  const rawLines = ransacLines(edgels, rparams);
 
-  // extend lines (simple)
-  const extended = lines.map(l=>{
-    const dir = l.dir || {x:(l.p2.x-l.p1.x), y:(l.p2.y-l.p1.y)}; const dn = Math.hypot(dir.x,dir.y)||1; dir.x/=dn;dir.y/=dn;
-    // step extend until mag small
-    let p1 = {...l.p1}, p2 = {...l.p2};
-    for(let k=0;k<120;k++){ const nx=Math.round(p1.x - dir.x*1.5), ny=Math.round(p1.y - dir.y*1.5); if(nx<=1||ny<=1||nx>=procW-2||ny>=procH-2) break; if(sobel.mag[ny*procW + nx] < 4) break; p1.x = nx; p1.y=ny;}
-    for(let k=0;k<120;k++){ const nx=Math.round(p2.x + dir.x*1.5), ny=Math.round(p2.y + dir.y*1.5); if(nx<=1||ny<=1||nx>=procW-2||ny>=procH-2) break; if(sobel.mag[ny*procW + nx] < 4) break; p2.x = nx; p2.y=ny;}
-    return {p1,p2,dir};
-  });
+  // filter by length to remove tiny internal lines
+  const longLines = rawLines.filter(l => l.length > Math.max(30, procW*0.08));
+  const topLines = longLines.slice(0, 12);
 
-  // find quads (brute force)
+  // extend lines
+  const extended = topLines.map(l => extendLine(l, sobel, procW, procH));
+
+  // find quads (brute-force on top lines)
   const quads = [];
   for(let i=0;i<extended.length;i++){
     for(let j=i+1;j<extended.length;j++){
       for(let k=j+1;k<extended.length;k++){
-        for(let l=k+1;l<extended.length;l++){
-          const L=[extended[i],extended[j],extended[k],extended[l]];
-          const perms = [[0,1,2,3],[0,2,1,3],[0,1,3,2],[0,3,1,2]]; // few perms
+        for(let m=k+1;m<extended.length;m++){
+          const L = [extended[i], extended[j], extended[k], extended[m]];
+          const perms = [[0,1,2,3],[0,1,3,2],[0,2,1,3],[0,3,1,2]];
           for(const perm of perms){
             const pts=[];
             let ok=true;
             for(let t=0;t<4;t++){
-              const a=L[perm[t]], b=L[perm[(t+1)%4]];
+              const a = L[perm[t]], b = L[perm[(t+1)%4]];
               const p = intersect(a.p1,a.p2,b.p1,b.p2);
               if(!p){ ok=false; break; }
               pts.push(p);
             }
             if(!ok) continue;
             const ordered = orderQuad(pts);
-            if(Math.abs(polygonArea(ordered)) < 80) continue;
-            if(!ordered) continue;
-            quads.push({pts:ordered});
+            if(!isConvex(ordered)) continue;
+            const area = Math.abs(polygonArea(ordered));
+            if(area < Math.max(400, (procW*procH)*0.003)) continue;
+            const lens = []; for(let ii=0;ii<4;ii++){ const a=ordered[ii], b=ordered[(ii+1)%4]; lens.push(Math.hypot(a.x-b.x,a.y-b.y)); }
+            const minL = Math.min(...lens), maxL = Math.max(...lens);
+            if(minL < 20) continue;
+            if(maxL / minL > 6) continue;
+            quads.push({pts: ordered, area});
           }
         }
       }
     }
   }
 
-  // draw results scaled to display
-  const scaleInv = canvas.width / procW;
+  // draw original video
   ctx.clearRect(0,0,canvas.width,canvas.height);
-  ctx.drawImage(video,0,0,canvas.width,canvas.height);
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-  // draw edgels if debug
-  if(debugMode){
-    ctx.fillStyle='yellow';
-    for(const e of edgels) ctx.fillRect(e.x*scaleInv-1,e.y*scaleInv-1,3,3);
-  }
-
-  // draw lines
-  ctx.lineWidth=3; ctx.strokeStyle='cyan';
+  // draw extended lines (display scale)
+  const scaleInv = canvas.width / procW;
+  ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(0,200,255,0.9)';
   for(const L of extended){
-    ctx.beginPath(); ctx.moveTo(L.p1.x*scaleInv, L.p1.y*scaleInv); ctx.lineTo(L.p2.x*scaleInv, L.p2.y*scaleInv); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(L.p1.x*scaleInv, L.p1.y*scaleInv);
+    ctx.lineTo(L.p2.x*scaleInv, L.p2.y*scaleInv);
+    ctx.stroke();
   }
 
-  // draw quads
-  ctx.lineWidth=4; ctx.strokeStyle='orange';
-  for(const q of quads){
-    ctx.beginPath(); ctx.moveTo(q.pts[0].x*scaleInv,q.pts[0].y*scaleInv);
-    for(let ii=1; ii<4; ii++) ctx.lineTo(q.pts[ii].x*scaleInv,q.pts[ii].y*scaleInv);
+  // draw quads and print coords (choose best by area)
+  let printed = false;
+  if(quads.length > 0){
+    quads.sort((a,b)=>b.area - a.area);
+    const q = quads[0];
+    const ptsDisp = q.pts.map(p => ({ x: p.x*scaleInv, y: p.y*scaleInv }));
+    ctx.lineWidth = 5; ctx.strokeStyle = 'rgba(255,140,20,0.95)'; ctx.beginPath();
+    ctx.moveTo(ptsDisp[0].x, ptsDisp[0].y);
+    for(let i=1;i<4;i++) ctx.lineTo(ptsDisp[i].x, ptsDisp[i].y);
     ctx.closePath(); ctx.stroke();
-    ctx.fillStyle='yellow'; for(const p of q.pts) ctx.beginPath(), ctx.arc(p.x*scaleInv,p.y*scaleInv,6,0,Math.PI*2), ctx.fill();
+    ctx.fillStyle='yellow';
+    for(const p of ptsDisp){ ctx.beginPath(); ctx.arc(p.x,p.y,6,0,Math.PI*2); ctx.fill(); }
+    coordsDiv.innerText = `گوشه‌ها (pixe l):\nTL (${Math.round(ptsDisp[0].x)}, ${Math.round(ptsDisp[0].y)})\nTR (${Math.round(ptsDisp[1].x)}, ${Math.round(ptsDisp[1].y)})\nBR (${Math.round(ptsDisp[2].x)}, ${Math.round(ptsDisp[2].y)})\nBL (${Math.round(ptsDisp[3].x)}, ${Math.round(ptsDisp[3].y)})`;
+    printed = true;
   }
 
-  const now = performance.now(); const fps = Math.round(1000/(now-last)); last=now;
-  stats.innerText = `edgels:${edgels.length} lines:${extended.length} quads:${quads.length} fps:${fps}`;
-  status.innerText = `procW:${procW} procH:${procH} scale:${scale.toFixed(2)}`;
+  if(!printed){
+    coordsDiv.innerText = 'مختصات: (هیچ)';
+  }
+
+  // stats
+  const now = performance.now();
+  const fps = Math.round(1000 / (now - lastTime));
+  lastTime = now;
+  statsDiv.innerText = `edgels:${edgels.length} lines:${topLines.length} quads:${quads.length} fps:${fps}`;
 
   requestAnimationFrame(loop);
 }
 
-function captureFrame(){
-  const data = canvas.toDataURL('image/png');
-  const a = document.createElement('a'); a.href=data; a.download='capture.png'; a.click();
-}
-
+// start
 </script>
 </body>
 </html>
