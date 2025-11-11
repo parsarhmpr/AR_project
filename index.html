@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Load FBX Model</title>
+    <style>
+        body { margin: 0; }
+        canvas { display: block; }
+    </style>
+</head>
+<body>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r152/loaders/FBXLoader.js"></script>
+
+    <script>
+        // صحنه، دوربین و رندرر را ایجاد کنید
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        // نورپردازی را اضافه کنید
+        const light = new THREE.HemisphereLight(0xffffff, 0x444444);
+        light.position.set(0, 20, 0);
+        scene.add(light);
+
+        // بارگذاری مدل FBX
+        const loader = new THREE.FBXLoader();
+        loader.load('bag3.fbx', function (object) {
+            scene.add(object);
+            object.position.y = -1; // موقعیت مدل را تنظیم کنید
+        }, undefined, function (error) {
+            console.error(error); // خطاها را در کنسول ثبت کنید
+        });
+
+        // تنظیم دوربین
+        camera.position.z = 5;
+
+        // تابع انیمیشن
+        function animate() {
+            requestAnimationFrame(animate);
+            renderer.render(scene, camera);
+        }
+
+        animate();
+
+        // تغییر اندازه رندرر در صورت تغییر اندازه پنجره
+        window.addEventListener('resize', function () {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
