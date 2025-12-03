@@ -1,57 +1,53 @@
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Load FBX Model</title>
-    <style>
-        body { margin: 0; }
-        canvas { display: block; }
-    </style>
+    <meta charset="UTF-8" />
 </head>
 <body>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r152/loaders/FBXLoader.js"></script>
+<script type="module">
 
-    <script>
-        // صحنه، دوربین و رندرر را ایجاد کنید
-        const scene = new THREE.Scene();
-        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
-        const renderer = new THREE.WebGLRenderer();
+    import * as THREE from "https://unpkg.com/three@0.150.0/build/three.module.js";
+    import { GLTFLoader } from "https://unpkg.com/three@0.150.0/examples/jsm/loaders/GLTFLoader.js";
+    import { OrbitControls } from "https://unpkg.com/three@0.150.0/examples/jsm/controls/OrbitControls.js";
+
+    let scene, camera, renderer;
+
+    function init() {
+        scene = new THREE.Scene();
+        scene.background = new THREE.Color(0xdddddd);
+
+        camera = new THREE.PerspectiveCamera(40, window.innerWidth / window.innerHeight, 1, 5000);
+        camera.position.set(800, 100, 1000);
+
+        renderer = new THREE.WebGLRenderer({ antialias: true });
         renderer.setSize(window.innerWidth, window.innerHeight);
         document.body.appendChild(renderer.domElement);
 
-        // نورپردازی را اضافه کنید
-        const light = new THREE.HemisphereLight(0xffffff, 0x444444);
-        light.position.set(0, 20, 0);
-        scene.add(light);
+        const controls = new OrbitControls(camera, renderer.domElement);
 
-        // بارگذاری مدل FBX
-        const loader = new THREE.FBXLoader();
-        loader.load('bag3.fbx', function (object) {
-            scene.add(object);
-            object.position.y = -1; // موقعیت مدل را تنظیم کنید
-        }, undefined, function (error) {
-            console.error(error); // خطاها را در کنسول ثبت کنید
+        const ambient = new THREE.AmbientLight(0x404040, 5);
+        scene.add(ambient);
+
+        const dir = new THREE.DirectionalLight(0xffffff, 2);
+        dir.position.set(0, 1, 0);
+        scene.add(dir);
+
+        const loader = new GLTFLoader();
+        loader.load("./scene.gltf", (gltf) => {
+            const model = gltf.scene;
+            model.scale.set(0.5, 0.5, 0.5);
+            scene.add(model);
+            animate();
         });
+    }
 
-        // تنظیم دوربین
-        camera.position.z = 5;
+    function animate() {
+        requestAnimationFrame(animate);
+        renderer.render(scene, camera);
+    }
 
-        // تابع انیمیشن
-        function animate() {
-            requestAnimationFrame(animate);
-            renderer.render(scene, camera);
-        }
+    init();
 
-        animate();
-
-        // تغییر اندازه رندرر در صورت تغییر اندازه پنجره
-        window.addEventListener('resize', function () {
-            camera.aspect = window.innerWidth / window.innerHeight;
-            camera.updateProjectionMatrix();
-            renderer.setSize(window.innerWidth, window.innerHeight);
-        });
-    </script>
+</script>
 </body>
 </html>
