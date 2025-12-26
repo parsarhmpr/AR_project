@@ -1,88 +1,376 @@
 <!DOCTYPE html>
 <html lang="fa">
 <head>
-  <meta charset="UTF-8">
-  <title>QR Code Corners Tracker</title>
-  <style>
-    body { margin: 0; overflow: hidden; }
-    video, canvas {
-      position: absolute;
-      top: 0; left: 0;
-      width: 100%; height: 100%;
-      object-fit: cover;
-    }
-    #output {
-      position: absolute;
-      top: 10px; left: 10px;
-      padding: 5px 10px;
-      background: rgba(0,0,0,0.6);
-      color: #fff;
-      font-family: monospace;
-      font-size: 14px;
-      border-radius: 8px;
-    }
-  </style>
+<meta charset="utf-8"/>
+<title>QR → Pose (jsQR)</title>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<style>
+  body{margin:0;background:#111;color:#eee;font-family:system-ui,Segoe UI,Roboto,Arial}
+  video, canvas{position:fixed; top:0; left:0; width:100%; height:100%; object-fit:cover}
+  #ui{position:fixed; left:8px; top:8px; z-index:50; background:rgba(0,0,0,0.6); padding:10px; border-radius:8px; max-width:360px}
+  label{display:block; font-size:13px; margin-top:6px; color:#ccc}
+  input[type=number], input[type=text]{width:100%; box-sizing:border-box;}
+  .small{font-size:12px;color:#bbb}
+  pre{white-space:pre-wrap;font-family:monospace;font-size:12px;color:#e6e6e6}
+  button{margin-top:6px}
+</style>
 </head>
 <body>
-  <video id="video" autoplay playsinline></video>
+  <video id="video" autoplay playsinline muted></video>
   <canvas id="canvas"></canvas>
-  <div id="output">Waiting for QR...</div>
 
-  <!-- jsQR -->
-  <script src="https://cdn.jsdelivr.net/npm/jsqr/dist/jsQR.js"></script>
-  <script>
-    const video = document.getElementById("video");
-    const canvas = document.getElementById("canvas");
-    const ctx = canvas.getContext("2d");
-    const output = document.getElementById("output");
+  <div id="ui">
+    <div class="small" id="status">درحال آماده‌سازی...</div>
 
-    // گرفتن دسترسی به دوربین
-    navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } })
-      .then(stream => {
-        video.srcObject = stream;
-        video.play();
-        requestAnimationFrame(tick);
-      })
-      .catch(err => console.error("Camera error:", err));
+    <label>marker size (mm): <input id="markerSize" type="number" value="60"></label>
+    <label>Camera FOV horiz (deg) — تخمینی: <input id="fov" type="number" value="60"></label>
+    <label>Use explicit fx (px)? (leave blank to use FOV) <input id="fx" type="text" placeholder="مثلاً 800"></label>
 
-    function drawLine(begin, end, color) {
-      ctx.beginPath();
-      ctx.moveTo(begin.x, begin.y);
-      ctx.lineTo(end.x, end.y);
-      ctx.lineWidth = 4;
-      ctx.strokeStyle = color;
-      ctx.stroke();
+    <div class="small" style="margin-top:6px">خروجی‌ها:</div>
+    <div id="out">
+      <pre id="outText">هیچ</pre>
+    </div>
+    <button id="calibrateBtn">کالیبره با مرکز تصویر (set cx,cy)</button>
+    <div class="small" style="margin-top:6px">نکته: اگر focal دقیق نداری، FOV را نزدیک مقدار گوشی‌ات تنظیم کن (معمولاً 50–70).</div>
+  </div>
+
+  <!-- jsQR CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+
+<script>
+/* QR -> Pose using jsQR
+   - detects QR corners with jsQR
+   - computes homography from model square to image corners
+   - decomposes homography using assumed camera intrinsics K (from FOV or explicit fx)
+   - prints: homography, rotation matrix, translation vector, Euler angles (deg), depth (same unit as markerSize)
+*/
+
+// DOM
+const video = document.getElementById('video');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const status = document.getElementById('status');
+const outText = document.getElementById('outText');
+
+const markerSizeInput = document.getElementById('markerSize');
+const fovInput = document.getElementById('fov');
+const fxInput = document.getElementById('fx');
+const calibrateBtn = document.getElementById('calibrateBtn');
+
+let K = null; // camera intrinsics (3x3)
+let Kinv = null;
+
+calibrateBtn.onclick = ()=> {
+  // recalc K right away using center (cx,cy)
+  computeKandInv();
+  status.innerText = 'K recalculated using current settings.';
+};
+
+async function startCamera(){
+  try{
+    const stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}, audio:false});
+    video.srcObject = stream;
+    await video.play();
+    status.innerText = 'دوربین آماده';
+    computeKandInv();
+    requestAnimationFrame(tick);
+  }catch(e){
+    status.innerText = 'خطا در دسترسی دوربین: ' + e.message;
+    console.error(e);
+  }
+}
+startCamera();
+
+function computeKandInv(){
+  // compute camera intrinsics from FOV or explicit fx
+  const canvasW = video.videoWidth || window.innerWidth;
+  const canvasH = video.videoHeight || window.innerHeight;
+  const cx = canvasW / 2;
+  const cy = canvasH / 2;
+  let fx = null, fy = null;
+  const fxVal = parseFloat(fxInput.value);
+  if(!isNaN(fxVal) && fxVal > 0){
+    fx = fxVal;
+    fy = fxVal;
+  } else {
+    // use FOV (horizontal) to estimate fx = (w/2) / tan(fov/2)
+    const fov = parseFloat(fovInput.value) || 60;
+    fx = (canvasW/2) / Math.tan((fov*Math.PI/180)/2);
+    fy = fx; // assume square pixels
+  }
+  K = [[fx, 0, cx],[0, fy, cy],[0,0,1]];
+  Kinv = invert3(K);
+}
+
+// ---------- linear algebra helpers ----------
+function invert3(M){
+  // M is 3x3 array
+  const a=M[0][0], b=M[0][1], c=M[0][2];
+  const d=M[1][0], e=M[1][1], f=M[1][2];
+  const g=M[2][0], h=M[2][1], i=M[2][2];
+  const A = e*i - f*h;
+  const B = -(d*i - f*g);
+  const C = d*h - e*g;
+  const D = -(b*i - c*h);
+  const E = a*i - c*g;
+  const F = -(a*h - b*g);
+  const G = b*f - c*e;
+  const H = -(a*f - c*d);
+  const I = a*e - b*d;
+  const det = a*A + b*B + c*C;
+  if(Math.abs(det) < 1e-12) return null;
+  const inv = [
+    [A/det, D/det, G/det],
+    [B/det, E/det, H/det],
+    [C/det, F/det, I/det]
+  ];
+  return inv;
+}
+function mulMatVec(M, v){
+  return [ M[0][0]*v[0] + M[0][1]*v[1] + M[0][2]*v[2],
+           M[1][0]*v[0] + M[1][1]*v[1] + M[1][2]*v[2],
+           M[2][0]*v[0] + M[2][1]*v[1] + M[2][2]*v[2] ];
+}
+function mulMatMat(A,B){
+  const R = [];
+  for(let i=0;i<3;i++){
+    R[i]=[];
+    for(let j=0;j<3;j++){
+      let s=0;
+      for(let k=0;k<3;k++) s+=A[i][k]*B[k][j];
+      R[i][j]=s;
     }
+  }
+  return R;
+}
+function normVec(v){ return Math.hypot(v[0],v[1],v[2]); }
+function scaleVec(v, s){ return [v[0]*s, v[1]*s, v[2]*s]; }
+function cross(a,b){ return [ a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0] ]; }
+function dot(a,b){ return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]; }
 
-    function tick() {
-      if (video.readyState === video.HAVE_ENOUGH_DATA) {
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+// ---------- homography (4-point direct linear solve) ----------
+function computeHomography(srcPts, dstPts){
+  // srcPts, dstPts: arrays of 4 points {x,y} (model -> image)
+  // Solve linear system for h0..h7 with h8=1
+  // For each pair (X,Y)->(u,v):
+  // u*(h6*X + h7*Y + 1) = h0*X + h1*Y + h2
+  // v*(h6*X + h7*Y + 1) = h3*X + h4*Y + h5
+  // Build A (8x8) and b (8)
+  const A = [];
+  const b = [];
+  for(let i=0;i<4;i++){
+    const X = srcPts[i].x, Y = srcPts[i].y;
+    const u = dstPts[i].x, v = dstPts[i].y;
+    // eq1
+    A.push([ X, Y, 1, 0, 0, 0, -u*X, -u*Y ]);
+    b.push(u);
+    // eq2
+    A.push([ 0, 0, 0, X, Y, 1, -v*X, -v*Y ]);
+    b.push(v);
+  }
+  const h8 = solveLinear8(A,b); // returns array of 8 unknowns
+  if(!h8) return null;
+  const h = [h8[0],h8[1],h8[2], h8[3],h8[4],h8[5], h8[6],h8[7], 1];
+  // return 3x3 homography
+  return [[h[0],h[1],h[2]],[h[3],h[4],h[5]],[h[6],h[7],h[8]]];
+}
 
-        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        const code = jsQR(imageData.data, imageData.width, imageData.height);
+function solveLinear8(A,b){
+  // simple Gaussian elimination for 8x8 system
+  const n = 8;
+  // build augmented matrix
+  const M = new Array(n);
+  for(let i=0;i<n;i++){ M[i] = new Array(n+1); for(let j=0;j<n;j++) M[i][j] = A[i][j]; M[i][n] = b[i]; }
 
-        if (code) {
-          // رسم چهارگوشه QR
-          drawLine(code.location.topLeftCorner, code.location.topRightCorner, "#FF3B58");
-          drawLine(code.location.topRightCorner, code.location.bottomRightCorner, "#FF3B58");
-          drawLine(code.location.bottomRightCorner, code.location.bottomLeftCorner, "#FF3B58");
-          drawLine(code.location.bottomLeftCorner, code.location.topLeftCorner, "#FF3B58");
-
-          // نمایش مختصات چهار گوشه
-          output.innerText = `
-topLeft:     (${Math.round(code.location.topLeftCorner.x)}, ${Math.round(code.location.topLeftCorner.y)})
-topRight:    (${Math.round(code.location.topRightCorner.x)}, ${Math.round(code.location.topRightCorner.y)})
-bottomRight: (${Math.round(code.location.bottomRightCorner.x)}, ${Math.round(code.location.bottomRightCorner.y)})
-bottomLeft:  (${Math.round(code.location.bottomLeftCorner.x)}, ${Math.round(code.location.bottomLeftCorner.y)})
-          `;
-        } else {
-          output.innerText = "QR not found...";
-        }
-      }
-      requestAnimationFrame(tick);
+  for(let k=0;k<n;k++){
+    // pivot
+    let iMax=k; let maxVal = Math.abs(M[k][k]);
+    for(let i=k+1;i<n;i++){ if(Math.abs(M[i][k]) > maxVal){ maxVal = Math.abs(M[i][k]); iMax = i; } }
+    if(Math.abs(M[iMax][k]) < 1e-12) return null; // singular
+    // swap
+    if(iMax !== k){ const tmp = M[k]; M[k] = M[iMax]; M[iMax] = tmp; }
+    // normalize pivot row
+    const pivot = M[k][k];
+    for(let j=k;j<=n;j++) M[k][j] /= pivot;
+    // eliminate
+    for(let i=0;i<n;i++){
+      if(i===k) continue;
+      const factor = M[i][k];
+      if(Math.abs(factor) < 1e-15) continue;
+      for(let j=k;j<=n;j++) M[i][j] -= factor * M[k][j];
     }
-  </script>
+  }
+  const x = new Array(n);
+  for(let i=0;i<n;i++) x[i] = M[i][n];
+  return x;
+}
+
+// ---------- decompose homography into R,T given K ----------
+function decomposeHomography(H, K, Kinv, modelScale){
+  // H: 3x3, K:3x3, Kinv:3x3, modelScale = markerSize (units)
+  // columns h1,h2,h3
+  const h1 = [H[0][0], H[1][0], H[2][0]];
+  const h2 = [H[0][1], H[1][1], H[2][1]];
+  const h3 = [H[0][2], H[1][2], H[2][2]];
+  // compute Kinv * hi
+  const Kinv_h1 = mulMatVec(Kinv, h1);
+  const Kinv_h2 = mulMatVec(Kinv, h2);
+  const Kinv_h3 = mulMatVec(Kinv, h3);
+  const norm1 = Math.hypot(Kinv_h1[0], Kinv_h1[1], Kinv_h1[2]);
+  const norm2 = Math.hypot(Kinv_h2[0], Kinv_h2[1], Kinv_h2[2]);
+  const lambda = 1.0 / ((norm1 + norm2)/2.0); // average scaling
+  // r1,r2,t (in camera coords)
+  let r1 = scaleVec(Kinv_h1, lambda);
+  let r2 = scaleVec(Kinv_h2, lambda);
+  let t = scaleVec(Kinv_h3, lambda);
+  // orthonormalize r1,r2 -> use SVD-like Gram-Schmidt
+  // r3 = r1 x r2
+  let r3 = cross(r1, r2);
+  // re-orthonormalize: make r2 = r3 x r1
+  const r1n = normalizeVec(r1);
+  const r3n = normalizeVec(r3);
+  const r2n = cross(r3n, r1n);
+  // form R
+  const R = [
+    [r1n[0], r2n[0], r3n[0]],
+    [r1n[1], r2n[1], r3n[1]],
+    [r1n[2], r2n[2], r3n[2]]
+  ];
+  // The translation t is in same units as model coordinates if model used in that unit.
+  // If src pts were 0..s (mm) then t.z is mm.
+  return {R, t, lambda};
+}
+
+function normalizeVec(v){
+  const n = Math.hypot(v[0], v[1], v[2]) || 1;
+  return [v[0]/n, v[1]/n, v[2]/n];
+}
+
+function rotToEulerZYX(R){
+  // assuming R is 3x3; returns [yaw(Z), pitch(Y), roll(X)] in radians
+  // ZYX convention
+  let sy = -R[2][0];
+  if(sy <= -1) sy = -1; if(sy >= 1) sy = 1;
+  const pitch = Math.asin(sy); // around Y
+  let roll = 0, yaw = 0;
+  const cosPitch = Math.cos(pitch);
+  if(Math.abs(cosPitch) > 1e-6){
+    roll = Math.atan2(R[2][1], R[2][2]);
+    yaw  = Math.atan2(R[1][0], R[0][0]);
+  } else {
+    // gimbal lock
+    roll = 0;
+    yaw = Math.atan2(-R[0][1], R[1][1]);
+  }
+  return [yaw, pitch, roll];
+}
+
+// ---------- main loop ----------
+let smoothing = {
+  age: 0,
+  prev: null,
+  alpha: 0.6
+};
+
+function processPose(corners, markerSize){
+  // corners: jsQR location: topLeft, topRight, bottomRight, bottomLeft -> we want order: TL, TR, BR, BL
+  const dstPts = [
+    {x: corners.topLeftCorner.x, y: corners.topLeftCorner.y},
+    {x: corners.topRightCorner.x, y: corners.topRightCorner.y},
+    {x: corners.bottomRightCorner.x, y: corners.bottomRightCorner.y},
+    {x: corners.bottomLeftCorner.x, y: corners.bottomLeftCorner.y}
+  ];
+  // model square in marker units (mm)
+  const s = parseFloat(markerSize) || 60;
+  const srcPts = [ {x:0,y:0}, {x:s,y:0}, {x:s,y:s}, {x:0,y:s} ];
+
+  const H = computeHomography(srcPts, dstPts);
+  if(!H) return null;
+
+  // ensure K and Kinv available
+  if(!K || !Kinv) computeKandInv();
+
+  const dec = decomposeHomography(H, K, Kinv, s);
+  const R = dec.R;
+  const t = dec.t; // in mm if s in mm
+  const lambda = dec.lambda;
+
+  const eul = rotToEulerZYX(R).map(x => x * 180/Math.PI);
+  // smoothing
+  let out = { H, R, t, eul, lambda };
+  if(!smoothing.prev){
+    smoothing.prev = out;
+    smoothing.age = 1;
+  } else {
+    // EMA on translation and euler
+    const a = smoothing.alpha;
+    const prev = smoothing.prev;
+    const tsm = { x: a*out.t[0] + (1-a)*prev.t[0], y: a*out.t[1] + (1-a)*prev.t[1], z: a*out.t[2] + (1-a)*prev.t[2] };
+    const esm = out.eul.map((v,i)=> a*v + (1-a)*(prev.eul[i] || 0));
+    smoothing.prev = {...out, t: [tsm.x, tsm.y, tsm.z], eul: esm};
+    smoothing.age++;
+    out = smoothing.prev;
+  }
+  return out;
+}
+
+function drawCorners(corners){
+  // draw marker polygon on canvas
+  ctx.strokeStyle = 'lime';
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.moveTo(corners.topLeftCorner.x, corners.topLeftCorner.y);
+  ctx.lineTo(corners.topRightCorner.x, corners.topRightCorner.y);
+  ctx.lineTo(corners.bottomRightCorner.x, corners.bottomRightCorner.y);
+  ctx.lineTo(corners.bottomLeftCorner.x, corners.bottomLeftCorner.y);
+  ctx.closePath();
+  ctx.stroke();
+  // draw small circles
+  ctx.fillStyle='yellow';
+  [corners.topLeftCorner, corners.topRightCorner, corners.bottomRightCorner, corners.bottomLeftCorner].forEach(p=>{
+    ctx.beginPath(); ctx.arc(p.x,p.y,6,0,Math.PI*2); ctx.fill();
+  });
+}
+
+function tick(){
+  if(video.readyState < 2){ requestAnimationFrame(tick); return; }
+  // canvas size
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  ctx.drawImage(video,0,0,canvas.width,canvas.height);
+  // get frame image data for jsQR
+  // we'll sample full size for best accuracy (you can downscale for speed)
+  const imageData = ctx.getImageData(0,0,canvas.width,canvas.height);
+  const code = jsQR(imageData.data, imageData.width, imageData.height, { inversionAttempts: "attemptBoth" });
+  if(code){
+    drawCorners(code.location);
+    const markerSize = parseFloat(markerSizeInput.value) || 60;
+    const pose = processPose(code.location, markerSize);
+    if(pose){
+      // print outputs nicely
+      const txt = [];
+      txt.push('Rotation (R):');
+      for(let r=0;r<3;r++) txt.push(pose.R[r].map(v=>v.toFixed(4)).join('\t'));
+      txt.push('');
+      txt.push('Translation t (same unit as markerSize):');
+      txt.push(`tx: ${pose.t[0].toFixed(2)}  ty: ${pose.t[1].toFixed(2)}  tz: ${pose.t[2].toFixed(2)}`);
+      txt.push('');
+      txt.push('Euler (deg) (yaw, pitch, roll):');
+      txt.push(pose.eul.map(v=>v.toFixed(2)).join(', '));
+      txt.push('');
+      txt.push('Scale λ (image->model): ' + pose.lambda.toFixed(6));
+      txt.push('');
+      txt.push('Homography H:');
+      for(let r=0;r<3;r++) txt.push(pose.H[r].map(v=>Number(v).toFixed(6)).join('\t'));
+      outText.textContent = txt.join('\n');
+    } else {
+      outText.textContent = 'خطا در محاسبه هوموگرافی';
+    }
+  } else {
+    outText.textContent = 'QR یافت نشد';
+  }
+  requestAnimationFrame(tick);
+}
+</script>
 </body>
 </html>
